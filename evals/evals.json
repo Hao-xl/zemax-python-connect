@@ -1,0 +1,23 @@
+﻿{
+  "skill_name": "zemax-python-connect",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我想用 Python 连接 Zemax，批量生成 .zos 文件，不需要看 GUI 实时变化。请告诉我应该用哪种连接方式并给出检查命令。",
+      "expected_output": "Selects Standalone Application mode, uses CreateNewApplication, runs scripts\\zosapi_locator.py and scripts\\standalone_ping.py, and asks for/pass --zemax-root when paths are not found.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "我已经打开 OpticStudio，希望运行 Python 后能在 Lens Data Editor 里实时看到修改。interactive_ping 显示 NotAuthorized，界面只点了 Python > 交互扩展。",
+      "expected_output": "Explains that the independent ZOS-API.NET Interactive Extension button must be opened, the waiting dialog with Instance Number must stay open, then rerun interactive_ping.py with --instance.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "运行下一个交互 demo 时提示 Refusing to replace the visible OpticStudio system，要怎么继续？",
+      "expected_output": "Tells the user to save the original lens, reopen/click the ZOS-API.NET Interactive Extension waiting dialog, and rerun the new program with --replace-current appended.",
+      "files": []
+    }
+  ]
+}
