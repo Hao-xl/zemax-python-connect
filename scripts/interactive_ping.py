@@ -8,20 +8,33 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from zemax_connection import ZemaxInteractiveAPI  # noqa: E402
+from zemax_connection import SUPPORTED_VERSIONS, ZemaxInteractiveAPI, classify_connection_error  # noqa: E402
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check ZOS-API Interactive Extension connection.")
     parser.add_argument("--zemax-root", default=None, help="OpticStudio install directory or Zemax data directory.")
+    parser.add_argument("--version", type=int, choices=SUPPORTED_VERSIONS, default=None)
+    parser.add_argument("--deep-search", action="store_true")
     parser.add_argument("--instance", type=int, default=0, help="Interactive Extension instance number shown in OpticStudio.")
     parser.add_argument("--json", action="store_true", help="Print full diagnostic JSON.")
     args = parser.parse_args()
 
     try:
-        with ZemaxInteractiveAPI(zemax_root=args.zemax_root, instance=args.instance, require_valid_license=False) as z:
+        with ZemaxInteractiveAPI(
+            zemax_root=args.zemax_root,
+            instance=args.instance,
+            require_valid_license=False,
+            preferred_version=args.version,
+            deep_search=args.deep_search,
+        ) as z:
             info = z.diagnostic_info()
-            ok = bool(info.get("is_valid_license")) and bool(info.get("has_primary_system"))
+            ok = (
+                bool(info.get("connected"))
+                and bool(info.get("mode_valid"))
+                and bool(info.get("is_valid_license"))
+                and bool(info.get("has_primary_system"))
+            )
             status = "OK" if ok else "NOT_AUTHORIZED"
             if args.json:
                 info["status"] = status
@@ -40,13 +53,16 @@ def main() -> int:
                 print(f"HAS_PRIMARY_SYSTEM={info.get('has_primary_system', False)}")
         return 0 if status == "OK" else 2
     except Exception as exc:
+        classification = classify_connection_error(exc)
         if args.json:
-            print(json.dumps({"mode": "InteractiveExtension", "instance": args.instance, "status": "CONNECT_FAILED", "error": str(exc)}, ensure_ascii=False, indent=2))
+            print(json.dumps({"mode": "InteractiveExtension", "instance": args.instance, "status": "CONNECT_FAILED", "error": str(exc), **classification}, ensure_ascii=False, indent=2))
         else:
             print("MODE=InteractiveExtension")
             print(f"INSTANCE={args.instance}")
             print("STATUS=CONNECT_FAILED")
             print(f"ERROR={exc}")
+            print(f"ERROR_CODE={classification['error_code']}")
+            print(f"ACTION={classification['action']}")
         return 1
 
 

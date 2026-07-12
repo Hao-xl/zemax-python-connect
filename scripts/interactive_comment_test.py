@@ -8,7 +8,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from zemax_connection import ZemaxInteractiveAPI  # noqa: E402
+from zemax_connection import SUPPORTED_VERSIONS, ZemaxInteractiveAPI, classify_connection_error  # noqa: E402
 
 
 def ensure_two_editable_surfaces(system) -> None:
@@ -20,12 +20,19 @@ def ensure_two_editable_surfaces(system) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Make a safe visible comment edit through Interactive Extension.")
     parser.add_argument("--zemax-root", default=None, help="OpticStudio install directory or Zemax data directory.")
+    parser.add_argument("--version", type=int, choices=SUPPORTED_VERSIONS, default=None)
+    parser.add_argument("--deep-search", action="store_true")
     parser.add_argument("--instance", type=int, default=0, help="Interactive Extension instance number shown in OpticStudio.")
     parser.add_argument("--comment", default="Touched by Python Interactive Extension")
     args = parser.parse_args()
 
     try:
-        with ZemaxInteractiveAPI(zemax_root=args.zemax_root, instance=args.instance) as z:
+        with ZemaxInteractiveAPI(
+            zemax_root=args.zemax_root,
+            preferred_version=args.version,
+            deep_search=args.deep_search,
+            instance=args.instance,
+        ) as z:
             system = z.system
             ensure_two_editable_surfaces(system)
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -47,10 +54,13 @@ def main() -> int:
             print(f"SURFACE_2_COMMENT={s2.Comment}")
             return 0
     except Exception as exc:
+        classification = classify_connection_error(exc)
         print("MODE=InteractiveExtension")
         print(f"INSTANCE={args.instance}")
         print("STATUS=FAILED")
         print(f"ERROR={exc}")
+        print(f"ERROR_CODE={classification['error_code']}")
+        print(f"ACTION={classification['action']}")
         return 1
 
 

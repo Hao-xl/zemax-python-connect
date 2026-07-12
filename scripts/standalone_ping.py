@@ -8,20 +8,33 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from zemax_connection import ZemaxStandaloneAPI  # noqa: E402
+from zemax_connection import SUPPORTED_VERSIONS, ZemaxStandaloneAPI, classify_connection_error  # noqa: E402
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check ZOS-API Standalone Application connection.")
     parser.add_argument("--zemax-root", default=None, help="OpticStudio install directory or Zemax data directory.")
+    parser.add_argument("--version", type=int, choices=SUPPORTED_VERSIONS, default=None)
+    parser.add_argument("--deep-search", action="store_true")
     parser.add_argument("--keep-open", action="store_true", help="Do not close the standalone OpticStudio instance on exit.")
     parser.add_argument("--json", action="store_true", help="Print full diagnostic JSON.")
     args = parser.parse_args()
 
     try:
-        with ZemaxStandaloneAPI(zemax_root=args.zemax_root, close_on_exit=not args.keep_open, require_valid_license=False) as z:
+        with ZemaxStandaloneAPI(
+            zemax_root=args.zemax_root,
+            close_on_exit=not args.keep_open,
+            require_valid_license=False,
+            preferred_version=args.version,
+            deep_search=args.deep_search,
+        ) as z:
             info = z.diagnostic_info()
-            ok = bool(info.get("is_valid_license")) and bool(info.get("has_primary_system"))
+            ok = (
+                bool(info.get("connected"))
+                and bool(info.get("mode_valid"))
+                and bool(info.get("is_valid_license"))
+                and bool(info.get("has_primary_system"))
+            )
             status = "OK" if ok else "NOT_AUTHORIZED"
             if args.json:
                 info["status"] = status
@@ -39,12 +52,15 @@ def main() -> int:
                 print(f"HAS_PRIMARY_SYSTEM={info.get('has_primary_system', False)}")
         return 0 if status == "OK" else 2
     except Exception as exc:
+        classification = classify_connection_error(exc)
         if args.json:
-            print(json.dumps({"mode": "StandaloneApplication", "status": "CONNECT_FAILED", "error": str(exc)}, ensure_ascii=False, indent=2))
+            print(json.dumps({"mode": "StandaloneApplication", "status": "CONNECT_FAILED", "error": str(exc), **classification}, ensure_ascii=False, indent=2))
         else:
             print("MODE=StandaloneApplication")
             print("STATUS=CONNECT_FAILED")
             print(f"ERROR={exc}")
+            print(f"ERROR_CODE={classification['error_code']}")
+            print(f"ACTION={classification['action']}")
         return 1
 
 

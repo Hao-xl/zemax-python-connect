@@ -1,233 +1,162 @@
 ﻿from __future__ import annotations
 
 import json
-import os
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
-
-try:
-    import winreg  # type: ignore
-except ImportError:  # pragma: no cover - ZOS-API is Windows-only, but imports should stay safe.
-    winreg = None  # type: ignore
+from typing import Any
 
 
-class ZemaxConnectionError(RuntimeError):
-    """Raised when OpticStudio/ZOS-API cannot be located or connected."""
+from zemax_discovery import (  # noqa: E402
+    EXHAUSTIVE_SEARCH_ESTIMATE,
+    ExhaustiveSearchConfirmationRequired,
+    MultipleZemaxInstallationsError,
+    ScanStats,
+    SUPPORTED_VERSIONS,
+    ZOSAPILocation,
+    ZemaxDiscoveryError,
+    candidate_roots,
+    detect_version,
+    discover_candidates,
+    locate_zosapi,
+    norm_path,
+    root_kind,
+)
+
+# Preserve the public exception name while making discovery and connection failures catchable together.
+ZemaxConnectionError = ZemaxDiscoveryError
 
 
-@dataclass
-class ZOSAPILocation:
-    requested_root: str | None
-    resolved_root: str
-    root_kind: str
-    net_helper_path: str
-    initializer_path: str
-    zemax_dir: str | None = None
-    notes: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-def _norm(path: str | Path) -> str:
-    return os.path.normpath(str(path))
-
-
-def _exists(path: str | Path) -> bool:
-    try:
-        return Path(path).exists()
-    except OSError:
-        return False
-
-
-def _read_registry_value(root: int, subkey: str, value_name: str) -> str | None:
-    if winreg is None:
-        return None
-    try:
-        key = winreg.OpenKey(winreg.ConnectRegistry(None, root), subkey, 0, winreg.KEY_READ)
-    except OSError:
-        return None
-    try:
-        return str(winreg.QueryValueEx(key, value_name)[0])
-    except OSError:
-        return None
-    finally:
-        try:
-            winreg.CloseKey(key)
-        except OSError:
-            pass
-
-
-def _registry_candidates() -> list[str]:
-    if winreg is None:
-        return []
-    out: list[str] = []
-    roots = [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]
-    subkeys = [
-        r"Software\Zemax",
-        r"Software\WOW6432Node\Zemax",
-    ]
-    names = ["ZemaxRoot", "InstallRoot", "Root", "ZemaxDirectory"]
-    for root in roots:
-        for subkey in subkeys:
-            for name in names:
-                value = _read_registry_value(root, subkey, name)
-                if value:
-                    out.append(value)
-    return out
-
-
-def _common_candidates() -> list[str]:
-    candidates: list[str] = []
-    home = Path.home()
-    candidates.append(str(home / "Documents" / "Zemax"))
-
-    program_roots = [
-        os.environ.get("ProgramFiles"),
-        os.environ.get("ProgramFiles(x86)"),
-        r"C:\Program Files",
-        r"C:\Program Files (x86)",
-    ]
-    patterns = [
-        "Ansys Zemax OpticStudio*",
-        "ANSYS Zemax OpticStudio*",
-        "Zemax OpticStudio*",
-        "OpticStudio*",
-    ]
-    for base in program_roots:
-        if not base or not _exists(base):
-            continue
-        for pattern in patterns:
-            try:
-                candidates.extend(str(path) for path in Path(base).glob(pattern))
-            except OSError:
-                pass
-
-    ansys_root = Path(r"C:\Program Files\ANSYS Inc")
-    if ansys_root.exists():
-        try:
-            candidates.extend(str(path) for path in ansys_root.glob(r"v*\Zemax OpticStudio*"))
-            candidates.extend(str(path) for path in ansys_root.glob(r"v*\OpticStudio*"))
-        except OSError:
-            pass
-    return candidates
-
-
-def candidate_roots(explicit_root: str | None = None) -> list[str]:
-    """Return likely OpticStudio install/data roots without verifying them."""
-    raw: list[str] = []
-    if explicit_root:
-        raw.append(explicit_root)
-    for key in ("ZEMAX_ROOT", "OPTICSTUDIO_ROOT", "ZEMAX_DATA_DIR"):
-        value = os.environ.get(key)
-        if value:
-            raw.append(value)
-    raw.extend(_registry_candidates())
-    raw.extend(_common_candidates())
-
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in raw:
-        normalized = _norm(item)
-        if normalized.lower() in seen:
-            continue
-        seen.add(normalized.lower())
-        out.append(normalized)
-    return out
-
-
-def root_kind(root: str | Path) -> str:
-    root = _norm(root)
-    if (
-        _exists(Path(root) / "ZOSAPI_NetHelper.dll")
-        and _exists(Path(root) / "ZOSAPI.dll")
-        and _exists(Path(root) / "ZOSAPI_Interfaces.dll")
-    ):
-        return "install"
-    if _exists(Path(root) / "ZOS-API" / "Libraries" / "ZOSAPI_NetHelper.dll"):
-        return "data"
-    if _exists(Path(root) / "ZOSAPI_NetHelper.dll"):
-        return "nethelper-only"
-    return "unknown"
-
-
-def net_helper_candidates(root: str | Path) -> list[str]:
-    root = Path(root)
-    return [
-        str(root / "ZOSAPI_NetHelper.dll"),
-        str(root / "ZOS-API" / "Libraries" / "ZOSAPI_NetHelper.dll"),
-    ]
-
-
-def locate_zosapi(explicit_root: str | None = None) -> ZOSAPILocation:
-    """Locate ZOSAPI_NetHelper.dll and decide how ZOSAPI_Initializer should be called."""
-    errors: list[str] = []
-    for root in candidate_roots(explicit_root):
-        kind = root_kind(root)
-        for net_helper in net_helper_candidates(root):
-            if not _exists(net_helper):
-                continue
-            initializer_path = root if kind == "install" else ""
-            notes: list[str] = []
-            if kind == "data":
-                notes.append("Resolved a Zemax data directory; Initialize() will discover the OpticStudio install path.")
-            elif kind == "install":
-                notes.append("Resolved an OpticStudio install directory; Initialize(root) will use this explicit path.")
-            else:
-                notes.append("Resolved ZOSAPI_NetHelper.dll, but root is not a full install/data directory.")
-            return ZOSAPILocation(
-                requested_root=explicit_root,
-                resolved_root=root,
-                root_kind=kind,
-                net_helper_path=_norm(net_helper),
-                initializer_path=initializer_path,
-                notes=notes,
-            )
-        errors.append(f"No ZOSAPI_NetHelper.dll under {root}")
-
-    detail = "\n".join(errors[-8:])
-    raise ZemaxConnectionError(
-        "Cannot locate ZOSAPI_NetHelper.dll. Pass --zemax-root pointing to the OpticStudio install "
-        "directory or the Zemax data directory. Checked candidates:\n" + detail
+def initialize_zosapi(
+    explicit_root: str | None = None,
+    preferred_version: int | None = None,
+    deep_search: bool = False,
+    *,
+    exhaustive_search: bool = False,
+    confirm_long_scan: bool = False,
+    scan_stats: ScanStats | None = None,
+    candidates: list[Any] | None = None,
+) -> tuple[Any, ZOSAPILocation]:
+    """Locate NetHelper first, then initialize and validate the actual install directory."""
+    location = locate_zosapi(
+        explicit_root,
+        preferred_version,
+        deep_search,
+        exhaustive_search=exhaustive_search,
+        confirm_long_scan=confirm_long_scan,
+        scan_stats=scan_stats,
+        candidates=candidates,
     )
-
-
-def initialize_zosapi(explicit_root: str | None = None) -> tuple[Any, ZOSAPILocation]:
-    """Load pythonnet CLR references and import ZOSAPI."""
-    location = locate_zosapi(explicit_root)
 
     try:
         import clr  # type: ignore
     except ImportError as exc:
-        raise ZemaxConnectionError("pythonnet is required. Install with: pip install pythonnet") from exc
+        raise ZemaxConnectionError("pythonnet is required. Install with: python -m pip install pythonnet") from exc
 
-    clr.AddReference(location.net_helper_path)
-    import ZOSAPI_NetHelper  # type: ignore
+    try:
+        clr.AddReference(location.net_helper_path)
+        import ZOSAPI_NetHelper  # type: ignore
 
-    if location.initializer_path:
-        initialized = ZOSAPI_NetHelper.ZOSAPI_Initializer.Initialize(location.initializer_path)
-    else:
-        initialized = ZOSAPI_NetHelper.ZOSAPI_Initializer.Initialize()
+        if location.initializer_path:
+            initialized = ZOSAPI_NetHelper.ZOSAPI_Initializer.Initialize(location.initializer_path)
+        else:
+            initialized = ZOSAPI_NetHelper.ZOSAPI_Initializer.Initialize()
+    except Exception as exc:
+        raise ZemaxConnectionError(f"Failed to load or initialize {location.net_helper_path}: {exc}") from exc
 
     if not initialized:
         raise ZemaxConnectionError("ZOSAPI_Initializer.Initialize() failed.")
 
-    zemax_dir = str(ZOSAPI_NetHelper.ZOSAPI_Initializer.GetZemaxDirectory())
-    location.zemax_dir = zemax_dir
-    clr.AddReference(str(Path(zemax_dir) / "ZOSAPI.dll"))
-    clr.AddReference(str(Path(zemax_dir) / "ZOSAPI_Interfaces.dll"))
+    zemax_dir_value = ZOSAPI_NetHelper.ZOSAPI_Initializer.GetZemaxDirectory()
+    if not zemax_dir_value:
+        raise ZemaxConnectionError("ZOSAPI initialized, but GetZemaxDirectory() returned an empty path.")
+    zemax_dir = Path(norm_path(str(zemax_dir_value)))
+    zosapi_path = zemax_dir / "ZOSAPI.dll"
+    interfaces_path = zemax_dir / "ZOSAPI_Interfaces.dll"
+    missing = [str(path) for path in (zosapi_path, interfaces_path) if not path.exists()]
+    if missing:
+        raise ZemaxConnectionError(
+            "Resolved the OpticStudio install directory, but required DLLs are missing: " + ", ".join(missing)
+        )
+
+    location.zemax_dir = str(zemax_dir)
+    location.zosapi_path = str(zosapi_path)
+    location.interfaces_path = str(interfaces_path)
+    opticstudio_exe = zemax_dir / "OpticStudio.exe"
+    location.opticstudio_exe = str(opticstudio_exe) if opticstudio_exe.exists() else None
+    actual_version = detect_version(zemax_dir)
+    if actual_version is not None:
+        location.detected_version = actual_version
+    if preferred_version is not None and actual_version is not None and actual_version != preferred_version:
+        raise ZemaxConnectionError(
+            f"Requested OpticStudio {preferred_version}, but initializer resolved {actual_version}: {zemax_dir}"
+        )
+
+    clr.AddReference(str(zosapi_path))
+    clr.AddReference(str(interfaces_path))
 
     import ZOSAPI  # type: ignore
 
     return ZOSAPI, location
 
 
-def safe_getattr(obj: Any, name: str, default: str = "Unknown") -> Any:
+def safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
+    """Return the caller's default on getter failure; never return a truthy error string."""
     try:
         return getattr(obj, name)
-    except Exception as exc:
-        return f"{default}: {exc}"
+    except Exception:
+        return default
+
+
+def _license_is_valid(app: Any) -> bool:
+    return bool(safe_getattr(app, "IsValidLicenseForAPI", False))
+
+
+def _app_mode(app: Any) -> str:
+    return str(safe_getattr(app, "Mode", "Unknown"))
+
+
+def classify_connection_error(exc: BaseException) -> dict[str, str]:
+    message = str(exc)
+    lowered = message.casefold()
+    if isinstance(exc, ExhaustiveSearchConfirmationRequired) or "exhaustive_scan_confirmation_required" in lowered:
+        return {
+            "error_code": "EXHAUSTIVE_SCAN_CONFIRMATION_REQUIRED",
+            "action": (
+                f"Tell the user the scan estimate ({EXHAUSTIVE_SEARCH_ESTIMATE}) and ask permission. "
+                "Only after explicit approval, pass --exhaustive-search --confirm-long-scan."
+            ),
+        }
+    if ("ipc" in lowered or "remotingexception" in lowered) and (
+        "拒绝访问" in message or "access denied" in lowered or "access is denied" in lowered
+    ):
+        return {
+            "error_code": "IPC_ACCESS_DENIED",
+            "action": "Rerun the same Zemax Python command outside the agent sandbox with user approval.",
+        }
+    if isinstance(exc, MultipleZemaxInstallationsError):
+        return {"error_code": "MULTIPLE_INSTALLATIONS", "action": "Pass --version or --zemax-root."}
+    if "zosapi_nethelper.dll" in lowered:
+        return {
+            "error_code": "NETHELPER_NOT_FOUND",
+            "action": (
+                f"The bounded scan has already run. Tell the user an exhaustive scan is estimated at "
+                f"{EXHAUSTIVE_SEARCH_ESTIMATE}, ask permission, then rerun with "
+                "--exhaustive-search --confirm-long-scan."
+            ),
+        }
+    if "expected app_mode=plugin" in lowered:
+        return {
+            "error_code": "INTERACTIVE_MODE_MISMATCH",
+            "action": (
+                "In an agent environment, first rerun outside the sandbox. If it still returns Server, "
+                "reopen the independent Interactive Extension dialog and verify its instance number."
+            ),
+        }
+    if "connectasextension" in lowered:
+        return {
+            "error_code": "INTERACTIVE_SESSION_NOT_READY",
+            "action": "Open the independent Interactive Extension waiting dialog and use its instance number.",
+        }
+    return {"error_code": "CONNECTION_FAILED", "action": "Run doctor.py and inspect the diagnostic report."}
 
 
 def has_primary_system(app: Any) -> bool:
@@ -240,10 +169,19 @@ def has_primary_system(app: Any) -> bool:
 class ZemaxStandaloneAPI:
     """Create and control an independent OpticStudio application instance."""
 
-    def __init__(self, zemax_root: str | None = None, close_on_exit: bool = True, require_valid_license: bool = True) -> None:
+    def __init__(
+        self,
+        zemax_root: str | None = None,
+        close_on_exit: bool = True,
+        require_valid_license: bool = True,
+        preferred_version: int | None = None,
+        deep_search: bool = False,
+    ) -> None:
         self.requested_root = zemax_root
         self.close_on_exit = bool(close_on_exit)
         self.require_valid_license = bool(require_valid_license)
+        self.preferred_version = preferred_version
+        self.deep_search = bool(deep_search)
         self.zosapi: Any | None = None
         self.location: ZOSAPILocation | None = None
         self.connection: Any | None = None
@@ -251,40 +189,64 @@ class ZemaxStandaloneAPI:
         self.system: Any | None = None
 
     def connect(self) -> "ZemaxStandaloneAPI":
-        self.zosapi, self.location = initialize_zosapi(self.requested_root)
-        self.connection = self.zosapi.ZOSAPI_Connection()
-        self.app = self.connection.CreateNewApplication()
-        if self.app is None:
-            raise ZemaxConnectionError("CreateNewApplication() returned None.")
-        if self.require_valid_license and not bool(safe_getattr(self.app, "IsValidLicenseForAPI", False)):
-            raise ZemaxConnectionError(f"License does not support ZOS-API: {safe_getattr(self.app, 'LicenseStatus')}")
-        self.system = self.app.PrimarySystem
-        if self.require_valid_license and self.system is None:
-            raise ZemaxConnectionError("PrimarySystem is None.")
-        return self
+        try:
+            self.zosapi, self.location = initialize_zosapi(
+                self.requested_root, self.preferred_version, self.deep_search
+            )
+            self.connection = self.zosapi.ZOSAPI_Connection()
+            self.app = self.connection.CreateNewApplication()
+            if self.app is None:
+                raise ZemaxConnectionError("CreateNewApplication() returned None.")
+            if _app_mode(self.app).casefold() != "server":
+                raise ZemaxConnectionError(f"Standalone expected APP_MODE=Server, got {_app_mode(self.app)}.")
+            if self.require_valid_license and not _license_is_valid(self.app):
+                raise ZemaxConnectionError(
+                    f"License does not support ZOS-API: {safe_getattr(self.app, 'LicenseStatus', 'Unknown')}"
+                )
+            self.system = safe_getattr(self.app, "PrimarySystem")
+            if self.require_valid_license and self.system is None:
+                raise ZemaxConnectionError("PrimarySystem is None.")
+            return self
+        except Exception:
+            # __exit__ is not called when __enter__/connect fails, so clean up here.
+            self._close_created_application()
+            self._clear_references()
+            raise
+
+    def _close_created_application(self) -> None:
+        if self.app is not None:
+            try:
+                self.app.CloseApplication()
+            except Exception:
+                pass
+
+    def _clear_references(self) -> None:
+        self.system = None
+        self.app = None
+        self.connection = None
+        self.zosapi = None
 
     def close(self) -> None:
         try:
             if self.app is not None and self.close_on_exit:
-                self.app.CloseApplication()
+                self._close_created_application()
         finally:
-            self.system = None
-            self.app = None
-            self.connection = None
-            self.zosapi = None
+            self._clear_references()
 
     def diagnostic_info(self) -> dict[str, Any]:
         app = self.app
         info = self.location.to_dict() if self.location else {}
-        info.update({"connected": app is not None})
+        mode = _app_mode(app) if app is not None else "Unknown"
+        mode_valid = mode.casefold() == "server"
+        info.update({"connected": app is not None and mode_valid, "mode_valid": mode_valid})
         if app is not None:
             info.update({
-                "is_valid_license": bool(safe_getattr(app, "IsValidLicenseForAPI", False)),
-                "license_status": str(safe_getattr(app, "LicenseStatus")),
-                "app_mode": str(safe_getattr(app, "Mode")),
-                "serial_code": str(safe_getattr(app, "SerialCode")),
-                "zemax_data_dir": str(safe_getattr(app, "ZemaxDataDir")),
-                "samples_dir": str(safe_getattr(app, "SamplesDir")),
+                "is_valid_license": _license_is_valid(app),
+                "license_status": str(safe_getattr(app, "LicenseStatus", "Unknown")),
+                "app_mode": mode,
+                "serial_code": str(safe_getattr(app, "SerialCode", "")),
+                "zemax_data_dir": str(safe_getattr(app, "ZemaxDataDir", "Unknown")),
+                "samples_dir": str(safe_getattr(app, "SamplesDir", "Unknown")),
                 "has_primary_system": self.system is not None,
             })
         return info
@@ -300,10 +262,19 @@ class ZemaxStandaloneAPI:
 class ZemaxInteractiveAPI:
     """Connect to the visible OpticStudio GUI session opened by Interactive Extension."""
 
-    def __init__(self, zemax_root: str | None = None, instance: int = 0, require_valid_license: bool = True) -> None:
+    def __init__(
+        self,
+        zemax_root: str | None = None,
+        instance: int = 0,
+        require_valid_license: bool = True,
+        preferred_version: int | None = None,
+        deep_search: bool = False,
+    ) -> None:
         self.requested_root = zemax_root
         self.instance = int(instance)
         self.require_valid_license = bool(require_valid_license)
+        self.preferred_version = preferred_version
+        self.deep_search = bool(deep_search)
         self.zosapi: Any | None = None
         self.location: ZOSAPILocation | None = None
         self.connection: Any | None = None
@@ -311,20 +282,37 @@ class ZemaxInteractiveAPI:
         self.system: Any | None = None
 
     def connect(self) -> "ZemaxInteractiveAPI":
-        self.zosapi, self.location = initialize_zosapi(self.requested_root)
-        self.connection = self.zosapi.ZOSAPI_Connection()
-        self.app = self.connection.ConnectAsExtension(self.instance)
-        if self.app is None:
-            raise ZemaxConnectionError(
-                "ConnectAsExtension returned None. In OpticStudio, click the independent "
-                "Programming > Interactive Extension button in the ZOS-API.NET area and keep the waiting dialog open."
+        try:
+            self.zosapi, self.location = initialize_zosapi(
+                self.requested_root, self.preferred_version, self.deep_search
             )
-        if self.require_valid_license and not bool(safe_getattr(self.app, "IsValidLicenseForAPI", False)):
-            raise ZemaxConnectionError(f"License does not support ZOS-API: {safe_getattr(self.app, 'LicenseStatus')}")
-        self.system = self.app.PrimarySystem
-        if self.require_valid_license and self.system is None:
-            raise ZemaxConnectionError("PrimarySystem is None. Open or create a lens file in the visible OpticStudio session.")
-        return self
+            self.connection = self.zosapi.ZOSAPI_Connection()
+            self.app = self.connection.ConnectAsExtension(self.instance)
+            if self.app is None:
+                raise ZemaxConnectionError(
+                    "ConnectAsExtension returned None. In OpticStudio, click the independent "
+                    "Programming > Interactive Extension button in the ZOS-API.NET area and keep the waiting dialog open."
+                )
+            if _app_mode(self.app).casefold() != "plugin":
+                license_status = safe_getattr(self.app, "LicenseStatus", "Unknown")
+                raise ZemaxConnectionError(
+                    f"Interactive Extension expected APP_MODE=Plugin, got {_app_mode(self.app)} "
+                    f"with LICENSE={license_status}. "
+                    "Reopen the independent waiting dialog and verify its instance number."
+                )
+            if self.require_valid_license and not _license_is_valid(self.app):
+                raise ZemaxConnectionError(
+                    f"License does not support ZOS-API: {safe_getattr(self.app, 'LicenseStatus', 'Unknown')}"
+                )
+            self.system = safe_getattr(self.app, "PrimarySystem")
+            if self.require_valid_license and self.system is None:
+                raise ZemaxConnectionError(
+                    "PrimarySystem is None. Open or create a lens file in the visible OpticStudio session."
+                )
+            return self
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         # Do not call CloseApplication() in Interactive Extension mode; OpticStudio owns the GUI session.
@@ -344,15 +332,17 @@ class ZemaxInteractiveAPI:
     def diagnostic_info(self) -> dict[str, Any]:
         app = self.app
         info = self.location.to_dict() if self.location else {}
-        info.update({"connected": app is not None, "instance": self.instance})
+        mode = _app_mode(app) if app is not None else "Unknown"
+        mode_valid = mode.casefold() == "plugin"
+        info.update({"connected": app is not None and mode_valid, "mode_valid": mode_valid, "instance": self.instance})
         if app is not None:
             info.update({
-                "is_valid_license": bool(safe_getattr(app, "IsValidLicenseForAPI", False)),
-                "license_status": str(safe_getattr(app, "LicenseStatus")),
-                "app_mode": str(safe_getattr(app, "Mode")),
-                "serial_code": str(safe_getattr(app, "SerialCode")),
-                "zemax_data_dir": str(safe_getattr(app, "ZemaxDataDir")),
-                "samples_dir": str(safe_getattr(app, "SamplesDir")),
+                "is_valid_license": _license_is_valid(app),
+                "license_status": str(safe_getattr(app, "LicenseStatus", "Unknown")),
+                "app_mode": mode,
+                "serial_code": str(safe_getattr(app, "SerialCode", "")),
+                "zemax_data_dir": str(safe_getattr(app, "ZemaxDataDir", "Unknown")),
+                "samples_dir": str(safe_getattr(app, "SamplesDir", "Unknown")),
                 "has_primary_system": self.system is not None,
             })
         return info
